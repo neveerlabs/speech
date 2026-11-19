@@ -58,7 +58,7 @@ Untuk menjalankan aplikasi dari toggle mode:
 ```bash
 python app.py --tray
 ```
-> *Klik tray icon speech lalu klik sekali untuk memulai, klik lagi untuk berhenti; klik kiri di toggle mode, pilih **Keluar** untuk menutup aplikasi*
+> *Klik kiri ikon tray untuk mulai atau menghentikan terjemahan. Klik kanan ikon tray, pilih **Tampilkan panel** untuk membuka panel chat (akan berubah menjadi **Tutup panel** saat panel terbuka), atau **close** untuk menutup aplikasi.*
 
 ### 3. Opsional: jalankan otomatis saat login XFCE
 
@@ -77,7 +77,15 @@ python install_xfce.py --remove
 
 ## Catatan
 
-- Saat ini, masih hanya audio saja yg dikirim secara streaming ke layanan Gemini, untuk bagian input belom
+- Terjemahan audio desktop tetap dikirim streaming terpisah dari fitur chat.
+- Panel chat terhubung langsung ke Gemini (`gemini-3.5-flash-lite`, thinking level minimal) tanpa RAG. Riwayat lokal memakai SQLite di `$XDG_DATA_HOME/speech-ai/speech_ai.sqlite3` (default: `~/.local/share/speech-ai/speech_ai.sqlite3`); seluruh pesan tersimpan dikirim sebagai konteks pada setiap permintaan. Pesan user dan balasan AI ditampilkan dengan Markdown bergaya GitHub (heading, list berindentasi ringkas, kutipan, kode, tautan, tabel, task list, dan format teks lainnya); balasan AI diminta hanya menggunakan Markdown, bukan HTML.
+- Panel chat dapat digeser dari header, dibatasi pada area desktop yang tersedia, dan menempel ke tepi layar saat dilepas dekat tepi.
+- Composer mengambang di atas area chat; scroll paling bawah menyediakan ruang agar pesan terbaru tetap terlihat utuh di atas composer.
+- Lampiran bisa dipilih dari file, ditempel dari clipboard dengan Ctrl+V (gambar), atau di-drag-and-drop ke area chat/input. Duplikat berdasarkan isi file tidak ditambahkan dua kali dalam composer. Maksimal 10 lampiran per pesan dan ukuran setiap file dibatasi 18 MiB. Saat masih di composer, file berada di cache sementara aplikasi; setelah pesan dikirim, isi file dan metadatanya disimpan sebagai BLOB di database. Lampiran yang dikirim tersedia untuk Gemini melalui tool pembaca lampiran selama 24 jam sejak pesan dikirim.
+- Pesan tampil tanpa timestamp. Waktu WIB disertakan sebagai konteks internal Gemini dan hanya boleh disebut dalam balasan jika diminta pengguna.
+- Lampiran ditampilkan dalam satu baris yang dapat digeser ke samping; klik foto/video untuk melihat pratinjau layar penuh. Pada video, klik tunggal untuk play/pause, klik ganda di sisi kiri/kanan untuk mundur/maju 5 detik, dan klik ganda lalu tahan sambil menyeret untuk zoom sementara. Foto juga dapat di-zoom dengan gerakan tahan-seret itu; zoom kembali normal setelah dilepas dan mengecil saat kursor ditarik kembali ke titik awal. Audio video diputar di preview; animasi seek muncul di area tetap sisi kiri/kanan sesuai arah. Log diagnostik internal Qt Multimedia disembunyikan secara default; error aplikasi tetap dilaporkan. Tombol X membatalkan lampiran atau menutup pratinjau.
+- Warning berulang dari kategori Qt AT-SPI disaring agar tidak membanjiri terminal; log critical dan kategori Qt lainnya tetap dipertahankan.
+- Pesan contoh tidak ditampilkan saat panel chat dibuka.
 - Jika koneksi Gemini gagal, API key berikutnya dicoba. Error dari capture audio tidak memicu pergantian API! `GEMINI_API_KEY` tunggal juga masih didukung untuk kompatibilitas
 - Aplikasi memakai monitor source dari sink audio default dan model `gemini-3.5-live-translate-preview`
 - Audio dikirim dalam potongan 100 ms, kecepatan subtitle tetap bergantung pada model dan jaringan, sehingga teks tidak selalu muncul tepat bersamaan dengan ucapan

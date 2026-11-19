@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from PySide6.QtCore import QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QLoggingCategory, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -16,7 +16,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+qt_logging_rules = os.environ.get("QT_LOGGING_RULES", "").replace(";", "\n").strip()
+if qt_logging_rules:
+    qt_logging_rules += "\n"
+QLoggingCategory.setFilterRules(
+    f"{qt_logging_rules}"
+    "qt.multimedia.*=false\n"
+    "qt.accessibility.atspi.warning=false"
+)
+
 from api_keys import parse_api_keys
+from chat_panel import ChatPanel
 from live_translation import LiveTranslationWorker
 from subtitle_text import merge_transcript_text, recent_wrapped_lines
 from system_tray import TranslationTray
@@ -199,9 +209,10 @@ def main() -> int:
     app = QApplication([sys.argv[0]])
     app.setQuitOnLastWindowClosed(False)
     overlay = SubtitleOverlay()
+    chat_panel = ChatPanel(api_keys=parse_api_keys(os.environ))
     tray: TranslationTray | None = None
     if QSystemTrayIcon.isSystemTrayAvailable():
-        tray = TranslationTray(app, overlay)
+        tray = TranslationTray(app, overlay, chat_panel)
     elif arguments.tray:
         print(
             "System tray tidak tersedia. Aktifkan Notification Area/Status "
@@ -211,8 +222,10 @@ def main() -> int:
         return 2
 
     app.aboutToQuit.connect(overlay.shutdown)
+    app.aboutToQuit.connect(chat_panel.shutdown)
     if tray:
         app.aboutToQuit.connect(tray.hide)
+        app.aboutToQuit.connect(chat_panel.hide)
     else:
         overlay.translation_error.connect(app.quit)
 

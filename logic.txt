@@ -1,0 +1,242 @@
+LOGIKA BACKEND SPEECH
+=====================
+
+Lingkup
+------
+Dokumen ini mencatat alur kerja inti aplikasi desktop: konfigurasi API,
+pengambilan audio output sistem, streaming terjemahan ke Gemini Live, pengolahan
+teks subtitle, pengelolaan proses, dan penyimpanan lampiran lokal.
+
+Aplikasi ini tidak menjalankan server HTTP atau backend chat terpisah. Proses
+desktop berkomunikasi langsung dengan Gemini Live untuk subtitle dan dengan
+Gemini GenerateContent untuk chat. Panel chat menyimpan riwayat secara lokal
+dalam SQLite; tidak ada server chat terpisah.
+
+Alur utama
+----------
+Audio output desktop
+    -> monitor source PipeWire/PulseAudio
+    -> parec menghasilkan PCM
+    -> potongan audio dikirim ke sesi Gemini Live
+    -> teks terjemahan diterima
+    -> teks digabung, dibatasi, dan dibungkus menjadi baris subtitle
+    -> overlay subtitle ditampilkan
+
+Alur chat
+---------
+composer dan cache draft
+    -> submit: pesan dan BLOB lampiran disimpan ke SQLite
+    -> seluruh riwayat database dikirim ke Gemini
+    -> Gemini dapat meminta isi lampiran aktif melalui tool
+    -> balasan model disimpan ke SQLite dan ditampilkan
+
+1. Konfigurasi dan API key
+--------------------------
+- app.py memuat file .env yang berada di root project menggunakan
+  load_dotenv(..., override=False). Variabel yang sudah ada di environment
+  sistem tidak ditimpa oleh isi .env
+- api_keys.py membaca GEMINI_API_KEYS sebagai daftar key dipisahkan koma.
+  Spasi di sekitar key dihapus, nilai kosong dilewati, dan key duplikat
+  dihilangkan tanpa mengubah urutan
+- Jika GEMINI_API_KEYS tidak menghasilkan key, GEMINI_API_KEY tunggal dipakai
+  sebagai format kompatibilitas lama
+- Key tidak ditulis ke source code. Pesan kegagalan yang memuat key akan
+  mengganti nilai key dengan teks penyamaran dan membatasi tiap detail error
+  hingga 500 karakter
+- Jika tidak ada key, aplikasi melaporkan error dan tidak memulai worker
+  terjemahan
+
+2. Menemukan dan menangkap audio output
+---------------------------------------
+- audio_capture.py memeriksa ketersediaan perintah pactl.
+- pactl get-default-sink dipakai untuk mendapatkan sink output default.
+- pactl list short sources dipakai untuk mencari source monitor dengan nama
+  persis "<nama-sink>.monitor". Monitor source ini menangkap suara yang keluar
+  dari desktop, bukan input mikrofon.
+- Jika pactl tidak tersedia, perintah gagal, atau monitor source tidak
+  ditemukan, AudioCaptureError dikembalikan ke aplikasi.
+- live_translation.py juga memastikan perintah parec tersedia.
+- Setelah sesi Gemini berhasil dibuka, worker menjalankan parec dengan opsi:
+  device monitor source, output raw, signed 16-bit little-endian, 16.000 Hz,
+  dan satu channel mono.
+- Audio tidak disimpan sebagai file oleh pipeline ini. Worker membaca stream
+  stdout parec secara bertahap.
+- Satu chunk berisi 100 ms audio. Pada 16.000 sampel/detik, 2 byte/sampel,
+  dan mono, ukuran chunk adalah 3.200 byte.
+
+3. Sesi streaming Gemini Live
+-----------------------------
+- Worker adalah QThread bernama LiveTranslationWorker. Operasi asinkronnya
+  dijalankan melalui asyncio.run().
+- Model yang dipakai adalah gemini-3.5-live-translate-preview melalui Google
+  Gen AI SDK, dengan API version v1beta.
+- Untuk tiap key, client Gemini dibuat dan koneksi live dibuka dengan konfigurasi:
+  * response modality AUDIO;
+  * transkripsi audio input dan output diaktifkan;
+  * target terjemahan Bahasa Indonesia (kode id);
+  * echo_target_language dinonaktifkan;
+  * instruksi sistem meminta terjemahan alami dan akurat, mempertahankan maksud,
+    konteks, serta nama diri, tanpa komentar tambahan atau pengulangan.
+- Setiap chunk PCM dikirim ke sesi sebagai audio/pcm;rate=16000.
+- Task penerima membaca response.server_content.output_transcription. Teks yang
+  tidak kosong dikirim ke aplikasi desktop melalui signal subtitle_received.
+- Pipeline ini menggunakan teks transkripsi output sebagai subtitle. Aplikasi
+  tidak mengeluarkan audio jawaban Gemini melalui speaker.
+
+4. Pergantian API key dan penanganan kegagalan
+----------------------------------------------
+- api_keys.py menjalankan setiap percobaan key secara berurutan.
+- Jika satu percobaan gagal, detail error disimpan bersama nomor key. Sebelum
+  mencoba key berikutnya, callback memberi informasi key berikutnya melalui
+  stderr; nilai key tidak dicetak.
+- AudioCaptureError tidak memicu failover key. Kesalahan perangkat, monitor,
+  atau proses capture bukan kegagalan autentikasi/layanan Gemini.
+- Jika semua key gagal, ApiKeyFailoverError berisi ringkasan kegagalan per key.
+- Jika proses sedang dihentikan, failover berhenti dan helper dapat kembali
+  tanpa memulai percobaan baru.
+- Worker meneruskan kegagalan ke signal error_occurred. app.py mengosongkan dan
+  menyembunyikan subtitle; mode tray juga menampilkan notifikasi error.
+- Jika parec menutup stream secara tidak terduga, worker membaca stderr proses
+  untuk menyertakan alasan jika tersedia.
+
+5. Menghentikan worker dan membersihkan proses
+----------------------------------------------
+- stop() memasang threading.Event yang dibaca oleh task capture, penerima, dan
+  task penjaga selama operasi live berjalan.
+- Task menunggu status stop dengan interval polling 100 ms.
+- Saat stop diminta, task terjemahan dibatalkan dan task turunannya dikumpulkan
+  agar tidak tertinggal.
+- Proses parec dihentikan dengan terminate(); jika belum berhenti setelah
+  timeout 2 detik, proses dipaksa berhenti dengan kill().
+- app.py memanggil shutdown saat aplikasi keluar. Shutdown menghentikan timer,
+  meminta worker berhenti, lalu menunggu worker selesai.
+- Signal SIGINT dan SIGTERM juga diteruskan ke QApplication untuk menutup
+  aplikasi secara teratur.
+
+6. Penggabungan dan penampilan subtitle
+---------------------------------------
+- SubtitleOverlay menyimpan teks gabungan sementara di memori.
+- merge_transcript_text menggabungkan potongan transkripsi yang mungkin saling
+  tumpang tindih. Ia mempertahankan update yang sudah tercakup, mengganti teks
+  pendek dengan versi lebih lengkap jika sesuai, dan mencocokkan token dengan
+  mengabaikan kapitalisasi serta tanda baca.
+- Setelah penggabungan, app.py hanya mempertahankan 300 kata terakhir sebagai
+  konteks teks lokal.
+- recent_wrapped_lines membungkus teks berdasarkan lebar font aktual, lalu
+  mempertahankan maksimal tiga baris terbaru.
+- Render subtitle ditunda/coalesced menggunakan timer 30 ms agar update yang
+  datang rapat tidak memicu render berulang.
+- Overlay ditempatkan di tengah bagian bawah area layar yang tersedia. Lebarnya
+  sekitar 84% layar, dibatasi antara 320 dan 1.200 piksel.
+- Timer memeriksa setiap 300 ms apakah subtitle terakhir sudah lebih lama dari
+  3,5 detik. Jika ya, teks dan overlay dikosongkan/disembunyikan.
+
+7. Siklus hidup aplikasi dan tray
+--------------------------------
+- Tanpa --tray, app.py mencoba memulai terjemahan setelah event loop Qt berjalan.
+- Dengan --tray, aplikasi mulai dalam keadaan idle. Aksi tray memulai atau
+  menghentikan terjemahan.
+- Jika system tray tersedia, TranslationTray menyelaraskan status worker dengan
+  ikon, tooltip, dan aksi menu.
+- Jika tray tidak tersedia saat --tray dipakai, aplikasi mencetak pesan dan
+  keluar dengan status 2.
+- Jika tray tidak tersedia pada mode foreground, error terjemahan dapat menutup
+  aplikasi.
+- install_xfce.py bukan server/backend runtime; skrip ini memasang atau
+  menghapus file launcher dan autostart XFCE yang menjalankan app.py --tray.
+
+8. Lampiran composer dan cache sementara
+----------------------------------------
+- chat_attachments.py menyalin lampiran ke direktori cache sementara milik
+  aplikasi menggunakan nama unik dengan awalan UUID 32 karakter.
+- Lampiran yang didukung oleh composer mencakup file lokal, gambar clipboard
+  yang disimpan sebagai PNG, dan file lokal yang masuk melalui drag-and-drop.
+- Batas yang diterapkan pada draft composer: maksimal 10 lampiran total dan
+  maksimal 18 MiB (18 x 1024 x 1024 byte) untuk tiap lampiran.
+- File lokal diperiksa ukurannya sebelum dan sesudah disalin. Gambar clipboard
+  diperiksa berdasarkan ukuran file PNG hasil penyimpanan. Item yang melewati
+  batas tidak ditambahkan; salinan gambar sementara dihapus jika ukurannya
+  terlalu besar.
+- Batas 10 dihitung dari semua item yang saat ini terpasang di composer, apa
+  pun cara item itu ditambahkan. Tombol batal menghapus salinan dari cache.
+- File draft berada di cache sementara aplikasi, bukan di database. Setelah
+  transaksi penyimpanan pesan dan lampiran ke database berhasil, salinan cache
+  dihapus. Jika penyimpanan gagal, draft dan lampirannya tetap di composer.
+- Cache draft tidak memakai timer retensi 24 jam. Timer retensi baru dimulai
+  setelah pesan dikirim dan menggunakan waktu persisted di tabel attachment.
+  Cache sementara dibersihkan ketika aplikasi keluar secara normal.
+
+9. Database pesan lokal dan chat Gemini
+----------------------------------------
+- chat_database.py mengelola SQLite lokal. File database berada di
+  $XDG_DATA_HOME/speech-ai/speech_ai.sqlite3; jika XDG_DATA_HOME tidak diatur,
+  lokasi default-nya ~/.local/share/speech-ai/speech_ai.sqlite3.
+- Aplikasi hanya memiliki satu sesi chat linear. Tidak ada tabel sesi terpisah,
+  percakapan lain, atau cabang pesan.
+- Tabel message menyimpan semua pesan user dan balasan model:
+  * id: INTEGER PRIMARY KEY.
+  * role: TEXT, nilainya dibatasi ke "user" atau "model".
+  * content: TEXT; boleh kosong jika pesan hanya berisi lampiran.
+  * timestamp: waktu WIB untuk dibaca manusia, dengan format seperti
+    "Rabu, 7 Oktober 2026, 15:59".
+  * created_at_utc: waktu kanonis pesan dalam UTC dengan format ISO 8601,
+    misalnya "2026-10-07T08:59:00Z". timestamp WIB dan created_at_utc harus
+    berasal dari satu waktu kejadian yang sama.
+- created_at_utc menjadi sumber acuan untuk urutan waktu dan perhitungan.
+  timestamp WIB disimpan sebagai representasi yang mudah dibaca. Role "model"
+  digunakan untuk balasan AI.
+- Tabel attachment menyimpan id, message_id (foreign key), nama file, MIME type,
+  ukuran byte, data file sebagai BLOB, attached_at_utc, dan sent_at_utc.
+  attached_at_utc mencatat waktu file masuk ke composer; sent_at_utc disamakan
+  dengan waktu pesan dikirim dan menjadi awal hitung mundur retensi.
+- Setiap permintaan chat memakai model gemini-3.5-flash-lite dengan thinking
+  level minimal, dan memuat seluruh riwayat message dari database secara
+  berurutan. Tidak ada RAG atau embedding pada tahap ini. Pesan user disimpan
+  sebelum request Gemini; balasan model disimpan setelah berhasil diterima.
+  Jika request gagal, pesan user tetap ada di riwayat dan error ditampilkan
+  kepada pengguna.
+- ChatResponseWorker menjalankan request Gemini di QThread agar UI tidak
+  terhenti. API key memakai parse_api_keys dan failover yang sama dengan fitur
+  terjemahan. Tombol kirim dinonaktifkan selama satu request berjalan.
+- Setiap pesan dikirim beserta timestamp WIB-nya, dan system instruction
+  menyertakan waktu sekarang Asia/Jakarta. Waktu ini hanya konteks untuk
+  interpretasi waktu relatif. Model dilarang menyebut waktu masuk pesan kecuali
+  diminta pengguna; UI juga tidak menampilkan timestamp pada gelembung chat.
+- Konten pesan user dan balasan model dirender sebagai Markdown, bukan HTML.
+  Renderer panel mempertahankan sintaks Markdown dan menerapkan tampilan gelap
+  bergaya GitHub untuk heading, list, kutipan, kode inline dan blok, tautan,
+  tabel, task list, garis pemisah, tebal, miring, dan coret. Indentasi list
+  dibuat ringkas agar teks tidak terdorong terlalu jauh dari tepi pesan.
+- Composer mengambang di atas viewport chat. Area kosong tambahan di bawah
+  riwayat menyesuaikan tinggi bagian viewport yang tertutup composer, sehingga
+  saat digulir ke paling bawah, pesan terbaru tetap dapat terlihat utuh di atas
+  composer.
+- Metadata lampiran yang masih tersedia disertakan pada konteks pesan. Gemini
+  dapat memanggil tool read_attachment dengan ID lampiran untuk membaca isi
+  file tertentu dari database. Tool hanya mengembalikan data jika lampiran
+  belum kedaluwarsa; jumlah pemanggilan dibatasi 10 per request.
+- Untuk tool read_attachment, aplikasi mengunggah BLOB lampiran ke Gemini Files
+  API, menunggu pemrosesan file jika diperlukan, lalu mengirim referensi file
+  sebagai hasil tool. File sementara di sisi Gemini dihapus setelah respons
+  selesai atau gagal.
+- sent_at_utc + 24 jam menentukan waktu kedaluwarsa, bukan attached_at_utc atau
+  mtime. Saat startup dan setiap 60 detik, database mengosongkan BLOB lampiran
+  yang kedaluwarsa; metadata baris attachment tetap ada agar riwayat pesan dan
+  nama lampiran masih dapat ditampilkan. Tool juga memeriksa masa berlaku
+  langsung sebelum membaca BLOB. SQLite secure_delete diaktifkan.
+
+10. Dependensi sistem dan Python
+-------------------------------
+- Python packages utama: google-genai, PySide6-Essentials, PySide6-Addons, dan
+  python-dotenv.
+- Pipeline audio mengandalkan PipeWire dengan kompatibilitas PulseAudio, serta
+  perintah pactl dan parec (di Kali tersedia melalui pulseaudio-utils).
+- Gemini Live memerlukan API key yang memiliki akses ke layanan/model yang
+  dikonfigurasi.
+- app.py menyembunyikan pesan level warning dari kategori Qt
+  qt.accessibility.atspi karena event AT-SPI berulang dapat membanjiri terminal.
+  Filter dibatasi ke warning kategori tersebut; pesan critical dan kategori
+  Qt lainnya tidak dinonaktifkan oleh aturan ini.
+- Log decoder video/audio Qt Multimedia terpisah dari pipeline penerjemah
+  audio desktop. Pesan decoder seperti error AAC berasal dari media yang
+  diputar di preview, bukan dari streaming audio ke Gemini.

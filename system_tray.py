@@ -8,13 +8,17 @@ from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
 
 if TYPE_CHECKING:
     from app import SubtitleOverlay
+    from chat_panel import ChatPanel
 
 
 class TranslationTray(QObject):
-    def __init__(self, app: QApplication, overlay: SubtitleOverlay) -> None:
+    def __init__(
+        self, app: QApplication, overlay: SubtitleOverlay, chat_panel: ChatPanel
+    ) -> None:
         super().__init__(app)
         self._app = app
         self._overlay = overlay
+        self._chat_panel = chat_panel
         self._icon = QSystemTrayIcon(self)
         self._menu = QMenu()
 
@@ -22,15 +26,19 @@ class TranslationTray(QObject):
         self._toggle_action.setCheckable(True)
         self._toggle_action.toggled.connect(self._toggle_translation)
         self._menu.addAction(self._toggle_action)
+        self._panel_action = QAction(self._panel_action_text(), self._menu)
+        self._panel_action.triggered.connect(self._toggle_chat_panel)
+        self._chat_panel.visibility_changed.connect(self._update_panel_action)
+        self._menu.addAction(self._panel_action)
         self._menu.addSeparator()
-        exit_action = QAction("Keluar", self._menu)
+        exit_action = QAction("close", self._menu)
         exit_action.triggered.connect(self._app.quit)
         self._menu.addAction(exit_action)
 
         self._icon.setContextMenu(self._menu)
         self._icon.activated.connect(self._icon_activated)
         self._icon.setIcon(self._theme_icon(False))
-        self._icon.setToolTip("Subtitle Gemini - nonaktif")
+        self._icon.setToolTip("Subtitle - nonaktif")
         self._icon.show()
 
         self._overlay.translation_finished.connect(self._translation_finished)
@@ -67,9 +75,21 @@ class TranslationTray(QObject):
             self._toggle_action.setEnabled(False)
             self._toggle_action.setText("Menghentikan terjemahan...")
             self._icon.setIcon(self._theme_icon(False))
-            self._icon.setToolTip("Subtitle Gemini - menghentikan")
+            self._icon.setToolTip("Subtitle - nonaktif")
         else:
             self.set_active(False)
+
+    def _panel_action_text(self) -> str:
+        return "Tutup panel" if self._chat_panel.isVisible() else "Tampilkan panel"
+
+    def _toggle_chat_panel(self) -> None:
+        if self._chat_panel.isVisible():
+            self._chat_panel.hide()
+        else:
+            self._chat_panel.show_panel()
+
+    def _update_panel_action(self, visible: bool) -> None:
+        self._panel_action.setText("Tutup panel" if visible else "Tampilkan panel")
 
     def set_active(self, active: bool) -> None:
         signals_blocked = self._toggle_action.blockSignals(True)
@@ -80,9 +100,8 @@ class TranslationTray(QObject):
         )
         self._toggle_action.blockSignals(signals_blocked)
         self._icon.setIcon(self._theme_icon(active))
-        self._icon.setToolTip(
-            "Subtitle Gemini - aktif" if active else "Subtitle Gemini - nonaktif"
-        )
+        status = "aktif" if active else "nonaktif"
+        self._icon.setToolTip(f"Subtitle - {status}")
 
     def _translation_finished(self) -> None:
         self.set_active(False)
@@ -100,7 +119,7 @@ class TranslationTray(QObject):
         self._toggle_action.setText("Menghentikan terjemahan...")
         self._toggle_action.blockSignals(False)
         self._icon.setIcon(self._theme_icon(False))
-        self._icon.setToolTip("Subtitle Gemini - menghentikan")
+        self._icon.setToolTip("Subtitle - nonaktif")
 
     def hide(self) -> None:
         self._icon.hide()
