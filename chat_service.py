@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from io import BytesIO
 import logging
 import sys
@@ -15,6 +16,7 @@ from api_keys import run_with_api_key_fallback
 from chat_database import (
     ChatDatabase,
     StoredMessage,
+    StoredAttachment,
     format_wib_timestamp,
     utc_now_iso,
 )
@@ -30,8 +32,16 @@ class GeminiChatService:
     def __init__(self, database: ChatDatabase) -> None:
         self._database = database
 
-    def generate(self, client: genai.Client) -> str:
+    def generate(
+        self,
+        client: genai.Client,
+        on_text_chunk: Callable[[str], None] | None = None,
+        on_stream_reset: Callable[[], None] | None = None,
+        unsaved_message: StoredMessage | None = None,
+    ) -> str:
         messages = self._database.load_messages()
+        if unsaved_message is not None:
+            messages = (*messages, unsaved_message)
         if not messages:
             raise RuntimeError("Tidak ada pesan untuk dikirim ke Gemini.")
 
@@ -87,22 +97,42 @@ class GeminiChatService:
 
         tool_call_count = 0
         uploaded_file_names: list[str] = []
+        unsaved_attachments = {
+            attachment.id: attachment
+            for attachment in (
+                unsaved_message.attachments if unsaved_message is not None else ()
+            )
+            if attachment.data is not None
+        }
         try:
             while True:
-                response: types.GenerateContentResponse = (
-                    client.models.generate_content(
-                        model=CHAT_MODEL,
-                        contents=contents,
-                        config=config,
-                    )
-                )
-                function_calls = response.function_calls or []
+                streamed_text: list[str] = []
+                function_calls: list[types.FunctionCall] = []
+                candidate_content: types.Content | None = None
+                for response in client.models.generate_content_stream(
+                    model=CHAT_MODEL,
+                    contents=contents,
+                    config=config,
+                ):
+                    if response.text:
+                        streamed_text.append(response.text)
+                        if on_text_chunk is not None and not response.function_calls:
+                            on_text_chunk(response.text)
+                    if response.function_calls:
+                        function_calls = response.function_calls
+                    if response.candidates:
+                        candidate = response.candidates[0]
+                        if candidate.content is not None:
+                            candidate_content = candidate.content
+
                 if not function_calls:
-                    answer = (response.text or "").strip()
+                    answer = "".join(streamed_text).strip()
                     if not answer:
                         raise RuntimeError("Gemini tidak mengembalikan teks balasan.")
                     return answer
 
+                if on_stream_reset is not None:
+                    on_stream_reset()
                 tool_call_count += len(function_calls)
                 if tool_call_count > MAX_TOOL_CALLS_PER_REQUEST:
                     raise RuntimeError(
@@ -110,17 +140,15 @@ class GeminiChatService:
                         "satu permintaan."
                     )
 
-                if not response.candidates:
-                    raise RuntimeError("Gemini mengirim tool tanpa kandidat respons.")
-                candidate = response.candidates[0]
-                if candidate.content is None:
+                if candidate_content is None:
                     raise RuntimeError("Gemini mengirim pemanggilan tool tanpa konten.")
-                contents.append(candidate.content)
+                contents.append(candidate_content)
                 function_responses = [
                     self._handle_tool_call(
                         function_call,
                         client,
                         uploaded_file_names,
+                        unsaved_attachments,
                     )
                     for function_call in function_calls
                 ]
@@ -160,6 +188,7 @@ class GeminiChatService:
         function_call: types.FunctionCall,
         client: genai.Client,
         uploaded_file_names: list[str],
+        unsaved_attachments: dict[int, StoredAttachment],
     ) -> types.Part:
         name = function_call.name or ""
         if name != "read_attachment":
@@ -182,7 +211,9 @@ class GeminiChatService:
                 response={"error": "ID lampiran tidak valid."},
             )
 
-        attachment = self._database.read_active_attachment(attachment_id)
+        attachment = unsaved_attachments.get(
+            attachment_id
+        ) or self._database.read_active_attachment(attachment_id)
         if attachment is None or attachment.data is None:
             return types.Part.from_function_response(
                 name=name,
@@ -251,16 +282,20 @@ class GeminiChatService:
 
 class ChatResponseWorker(QThread):
     reply_received = Signal(str)
+    reply_chunk_received = Signal(str)
+    stream_reset = Signal()
     error_occurred = Signal(str)
 
     def __init__(
         self,
         api_keys: tuple[str, ...],
         database: ChatDatabase,
+        unsaved_message: StoredMessage | None = None,
     ) -> None:
         super().__init__()
         self._api_keys = api_keys
         self._database = database
+        self._unsaved_message = unsaved_message
 
     def run(self) -> None:
         try:
@@ -272,7 +307,14 @@ class ChatResponseWorker(QThread):
 
     async def _run_request(self) -> str | None:
         async def attempt(api_key: str) -> str:
-            return await asyncio.to_thread(self._generate_with_key, api_key)
+            def generate() -> str:
+                try:
+                    return self._generate_with_key(api_key)
+                except Exception:
+                    self.stream_reset.emit()
+                    raise
+
+            return await asyncio.to_thread(generate)
 
         def on_fallback(next_key: int, total_keys: int) -> None:
             print(
@@ -290,6 +332,11 @@ class ChatResponseWorker(QThread):
     def _generate_with_key(self, api_key: str) -> str:
         client = genai.Client(api_key=api_key)
         try:
-            return GeminiChatService(self._database).generate(client)
+            return GeminiChatService(self._database).generate(
+                client,
+                self.reply_chunk_received.emit,
+                self.stream_reset.emit,
+                self._unsaved_message,
+            )
         finally:
             client.close()

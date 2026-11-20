@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -48,6 +49,59 @@ class ChatDatabaseTests(unittest.TestCase):
             [message.role for message in self.database.load_messages()],
             ["user", "model"],
         )
+
+    def test_append_exchange_saves_user_attachment_and_model_atomically(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "notes.txt"
+            path.write_bytes(b"exchange attachment")
+            user_message, model_message = self.database.append_exchange(
+                "Read this",
+                (PendingAttachment(path.name, path, utc_now_iso()),),
+                "I read it.",
+            )
+
+        self.assertEqual(
+            [(message.role, message.content) for message in self.database.load_messages()],
+            [("user", "Read this"), ("model", "I read it.")],
+        )
+        self.assertEqual(user_message.attachments[0].message_id, user_message.id)
+        self.assertEqual(
+            self.database.read_active_attachment(user_message.attachments[0].id).data,
+            b"exchange attachment",
+        )
+        self.assertEqual(model_message.role, "model")
+
+    def test_delete_message_removes_its_attachments(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "notes.txt"
+            path.write_bytes(b"temporary")
+            message = self.database.append_user_message(
+                "Remove me",
+                (PendingAttachment(path.name, path, utc_now_iso()),),
+            )
+
+        attachment_id = message.attachments[0].id
+        self.assertTrue(self.database.delete_message(message.id))
+        self.assertEqual(self.database.load_messages(), ())
+        self.assertIsNone(self.database.read_active_attachment(attachment_id))
+        self.assertFalse(self.database.delete_message(message.id))
+
+    def test_append_exchange_rolls_back_user_if_model_insert_fails(self) -> None:
+        self.database._connection.execute(
+            """
+            CREATE TRIGGER reject_model_insert
+            BEFORE INSERT ON message
+            WHEN NEW.role = 'model'
+            BEGIN
+                SELECT RAISE(ABORT, 'model insert rejected');
+            END
+            """
+        )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.database.append_exchange("User turn", (), "Model reply")
+
+        self.assertEqual(self.database.load_messages(), ())
 
     def test_attachment_retention_starts_at_send_time(self) -> None:
         with TemporaryDirectory() as temporary_directory:

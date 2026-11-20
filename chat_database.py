@@ -149,56 +149,56 @@ class ChatDatabase:
     ) -> StoredMessage:
         if not content.strip() and not attachments:
             raise ValueError("Pesan harus berisi teks atau lampiran.")
-        if len(attachments) > MAX_ATTACHMENTS_PER_MESSAGE:
-            raise ValueError(
-                f"Maksimal {MAX_ATTACHMENTS_PER_MESSAGE} lampiran per pesan."
-            )
+        payloads = self._attachment_payloads(attachments)
+        with self._lock, self._connection:
+            message_id = self._insert_user_message_locked(content, payloads)
+        return self.get_message(message_id)
 
-        payloads: list[tuple[PendingAttachment, str, bytes]] = []
-        for attachment in attachments:
-            data = attachment.path.read_bytes()
-            if len(data) > MAX_ATTACHMENT_SIZE_BYTES:
-                raise ValueError(
-                    f"{attachment.name}: ukuran lampiran melebihi 18 MiB."
-                )
-            mime_type = mimetypes.guess_type(attachment.name)[0]
-            payloads.append(
-                (attachment, mime_type or "application/octet-stream", data)
-            )
-
+    def append_exchange(
+        self,
+        user_content: str,
+        attachments: tuple[PendingAttachment, ...],
+        model_content: str,
+    ) -> tuple[StoredMessage, StoredMessage]:
+        if not user_content.strip() and not attachments:
+            raise ValueError("Pesan harus berisi teks atau lampiran.")
+        model_text = model_content.strip()
+        if not model_text:
+            raise ValueError("Balasan Gemini kosong.")
+        payloads = self._attachment_payloads(attachments)
         created_at_utc = utc_now_iso()
         timestamp = format_wib_timestamp(created_at_utc)
         with self._lock, self._connection:
+            user_message_id = self._insert_user_message_locked(
+                user_content,
+                payloads,
+                created_at_utc,
+                timestamp,
+            )
             cursor = self._connection.execute(
                 """
                 INSERT INTO message (role, content, timestamp, created_at_utc)
-                VALUES ('user', ?, ?, ?)
+                VALUES ('model', ?, ?, ?)
                 """,
-                (content, timestamp, created_at_utc),
+                (model_text, timestamp, created_at_utc),
             )
-            message_id = int(cursor.lastrowid)
-            self._connection.executemany(
-                """
-                INSERT INTO attachment (
-                    message_id, name, mime_type, size_bytes, data,
-                    attached_at_utc, sent_at_utc
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        message_id,
-                        attachment.name,
-                        mime_type,
-                        len(data),
-                        sqlite3.Binary(data),
-                        attachment.attached_at_utc or created_at_utc,
-                        created_at_utc,
-                    )
-                    for attachment, mime_type, data in payloads
-                ],
+            model_message_id = int(cursor.lastrowid)
+        return (
+            self.get_message(user_message_id),
+            self.get_message(model_message_id),
+        )
+
+    def delete_message(self, message_id: int) -> bool:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM attachment WHERE message_id = ?",
+                (message_id,),
             )
-        return self.get_message(message_id)
+            cursor = self._connection.execute(
+                "DELETE FROM message WHERE id = ?",
+                (message_id,),
+            )
+        return cursor.rowcount > 0
 
     def append_model_message(self, content: str) -> StoredMessage:
         text = content.strip()
@@ -216,6 +216,67 @@ class ChatDatabase:
             )
             message_id = int(cursor.lastrowid)
         return self.get_message(message_id)
+
+    @staticmethod
+    def _attachment_payloads(
+        attachments: tuple[PendingAttachment, ...],
+    ) -> list[tuple[PendingAttachment, str, bytes]]:
+        if len(attachments) > MAX_ATTACHMENTS_PER_MESSAGE:
+            raise ValueError(
+                f"Maksimal {MAX_ATTACHMENTS_PER_MESSAGE} lampiran per pesan."
+            )
+        payloads: list[tuple[PendingAttachment, str, bytes]] = []
+        for attachment in attachments:
+            data = attachment.path.read_bytes()
+            if len(data) > MAX_ATTACHMENT_SIZE_BYTES:
+                raise ValueError(
+                    f"{attachment.name}: ukuran lampiran melebihi 18 MiB."
+                )
+            mime_type = mimetypes.guess_type(attachment.name)[0]
+            payloads.append(
+                (attachment, mime_type or "application/octet-stream", data)
+            )
+        return payloads
+
+    def _insert_user_message_locked(
+        self,
+        content: str,
+        payloads: list[tuple[PendingAttachment, str, bytes]],
+        created_at_utc: str | None = None,
+        timestamp: str | None = None,
+    ) -> int:
+        message_time = created_at_utc or utc_now_iso()
+        display_timestamp = timestamp or format_wib_timestamp(message_time)
+        cursor = self._connection.execute(
+            """
+            INSERT INTO message (role, content, timestamp, created_at_utc)
+            VALUES ('user', ?, ?, ?)
+            """,
+            (content, display_timestamp, message_time),
+        )
+        message_id = int(cursor.lastrowid)
+        self._connection.executemany(
+            """
+            INSERT INTO attachment (
+                message_id, name, mime_type, size_bytes, data,
+                attached_at_utc, sent_at_utc
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    message_id,
+                    attachment.name,
+                    mime_type,
+                    len(data),
+                    sqlite3.Binary(data),
+                    attachment.attached_at_utc or message_time,
+                    message_time,
+                )
+                for attachment, mime_type, data in payloads
+            ],
+        )
+        return message_id
 
     def load_messages(self) -> tuple[StoredMessage, ...]:
         with self._lock:

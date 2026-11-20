@@ -25,10 +25,16 @@ Audio output desktop
 Alur chat
 ---------
 composer dan cache draft
-    -> submit: pesan dan BLOB lampiran disimpan ke SQLite
-    -> seluruh riwayat database dikirim ke Gemini
+    -> submit: coba simpan pesan user dan BLOB lampiran ke SQLite
+    -> jika simpan gagal, tampilkan toast tetapi request tetap berjalan
+    -> pesan yang belum tersimpan dikirim sebagai konteks sementara ke Gemini
+    -> jika Gemini gagal, hapus pesan user dari SQLite bila sempat tersimpan
+    -> pesan gagal tetap di UI/cache sampai aplikasi ditutup; tombol retry muncul
+    -> jika Gemini berhasil, simpan balasan; bila pesan user belum tersimpan,
+       simpan pesan user + lampiran + balasan dalam satu transaksi
     -> Gemini dapat meminta isi lampiran aktif melalui tool
-    -> balasan model disimpan ke SQLite dan ditampilkan
+    -> chunk balasan diteruskan ke UI dan ditampilkan per frame
+    -> jika simpan balasan gagal, pertahankan balasan di cache dan tampilkan retry
 
 1. Konfigurasi dan API key
 --------------------------
@@ -198,6 +204,36 @@ composer dan cache draft
 - ChatResponseWorker menjalankan request Gemini di QThread agar UI tidak
   terhenti. API key memakai parse_api_keys dan failover yang sama dengan fitur
   terjemahan. Tombol kirim dinonaktifkan selama satu request berjalan.
+- Request menggunakan generate_content_stream dari Google Gen AI SDK.
+  Chunk teks diteruskan melalui signal Qt; UI menampilkan hingga 32 karakter
+  setiap 20 ms dan merender ulang Markdown pada setiap frame. Setelah semua
+  chunk tampil, isi lengkap dirender ulang sebagai Markdown. Pesan user dan
+  lampiran dicoba disimpan sebelum request; kegagalan simpan tidak membatalkan
+  request. Jika belum tersimpan, pesan user disisipkan sebagai konteks sementara
+  untuk Gemini, termasuk BLOB lampiran yang tetap dapat dibaca oleh tool
+  read_attachment.
+- Jika Gemini gagal, pesan user yang sempat masuk database dihapus beserta
+  metadata/BLOB lampirannya. Pesan dan lampiran tetap berada di cache sementara
+  milik aplikasi serta baris pesan tetap terlihat; tombol retry tanpa border
+  muncul tepat di kiri bubble user. Retry Gemini mencoba menyimpan pesan user
+  lagi, tetapi tetap mengirim request jika penyimpanan kembali gagal.
+- Jika Gemini membalas tetapi simpan balasan gagal, balasan Markdown tetap
+  ditampilkan dan pesan user menampilkan tombol retry. Retry database hanya
+  mencoba menyimpan balasan yang sudah ada, tanpa request Gemini ulang. Jika
+  pesan user belum pernah tersimpan, pesan user, lampiran, dan balasan dicoba
+  disimpan atomik dalam satu transaksi; jika pesan user telah tersimpan, retry
+  hanya menyimpan balasan yang belum tersimpan.
+- Error database dan Gemini ditampilkan sebagai toast berisi konteks error.
+  Cache pesan gagal berlaku sampai aplikasi ditutup; lampiran cache tidak
+  dihapus sebelum proses pesan berhasil selesai.
+- Setiap error yang ditampilkan sebagai toast juga masuk ke cache notifikasi
+  selama aplikasi berjalan. Badge pada tombol notifikasi menampilkan jumlah
+  notifikasi yang belum dibaca; membuka detail otomatis menandai notifikasi
+  tersebut sudah dibaca. Daftar mendukung tandai semua dibaca, hapus satu atau
+  semua, dan salin detail error. Detail tetap lengkap untuk debugging, sedangkan
+  deskripsi daftar dipotong menjadi satu baris. Popover tertutup saat pengguna
+  mengeklik atau menggulir di luar area notifikasi; seluruh cache hilang saat
+  aplikasi ditutup.
 - Setiap pesan dikirim beserta timestamp WIB-nya, dan system instruction
   menyertakan waktu sekarang Asia/Jakarta. Waktu ini hanya konteks untuk
   interpretasi waktu relatif. Model dilarang menyebut waktu masuk pesan kecuali
@@ -206,11 +242,26 @@ composer dan cache draft
   Renderer panel mempertahankan sintaks Markdown dan menerapkan tampilan gelap
   bergaya GitHub untuk heading, list, kutipan, kode inline dan blok, tautan,
   tabel, task list, garis pemisah, tebal, miring, dan coret. Indentasi list
-  dibuat ringkas agar teks tidak terdorong terlalu jauh dari tepi pesan.
+  utama sejajar dengan teks biasa, sedangkan list bersarang mendapat indentasi
+  tambahan; tebal menggunakan bobot DemiBold. Code fence menampilkan label
+  bahasa dan warna sintaks sesuai lexer bahasa, termasuk Bash, serta nomor baris
+  dengan gutter sempit yang lebarnya mengikuti jumlah digit dan angka rata
+  tengah, serta panduan indentasi. Maksimal 10 baris kode ditampilkan sekaligus;
+  blok yang lebih panjang dapat digulir vertikal dan horizontal. Tombol salin
+  tanpa border selalu terlihat; setelah digunakan, ikonnya berubah menjadi
+  centang abu-abu sementara dan toast "Code copied" ditampilkan. Tombol salin
+  pada pesan user maupun model menyalin seluruh isi pesan dan menampilkan toast
+  "Message copied". Renderer dan interaksi tautan yang sama berlaku untuk kedua
+  jenis pesan. Tombol suka/tidak suka pada pesan model menampilkan ikon jempol
+  terisi abu-abu saat dipilih tanpa mengubah latar tombol; kedua pilihan saling
+  eksklusif, dapat dibatalkan dengan klik ulang, dan tidak disimpan atau
+  menjalankan aksi.
 - Composer mengambang di atas viewport chat. Area kosong tambahan di bawah
   riwayat menyesuaikan tinggi bagian viewport yang tertutup composer, sehingga
   saat digulir ke paling bawah, pesan terbaru tetap dapat terlihat utuh di atas
   composer.
+- Garis pemisah bawah header dibuat selebar panel hingga sisi kiri dan kanan;
+  garis disembunyikan saat pratinjau media mengambil alih panel.
 - Metadata lampiran yang masih tersedia disertakan pada konteks pesan. Gemini
   dapat memanggil tool read_attachment dengan ID lampiran untuk membaca isi
   file tertentu dari database. Tool hanya mengembalikan data jika lampiran
@@ -225,7 +276,24 @@ composer dan cache draft
   nama lampiran masih dapat ditampilkan. Tool juga memeriksa masa berlaku
   langsung sebelum membaca BLOB. SQLite secure_delete diaktifkan.
 
-10. Dependensi sistem dan Python
+10. Text-to-speech pesan AI
+---------------------------
+- Tombol speaker pada setiap balasan AI mengirim teks hasil render Markdown ke
+  Sound of Text menggunakan engine Google dan voice Bahasa Indonesia id-ID.
+- SoundOfTextWorker membuat audio melalui API Sound of Text dan memeriksa status
+  sampai URL audio HTTPS tersedia. Request berjalan pada QThread agar UI tetap
+  responsif.
+- UI menampilkan spinner selama audio disiapkan, warna putih saat audio
+  diputar, dan kembali ke ikon normal setelah selesai atau gagal. Klik tombol
+  saat menyiapkan audio membatalkan request; klik saat audio diputar
+  menghentikannya. Hanya satu pembacaan berjalan dalam satu waktu.
+- QMediaPlayer terpisah memutar URL audio langsung. Aplikasi tidak mengunduh
+  atau menyimpan teks/audio ke disk maupun database. Menyembunyikan panel atau
+  menutup aplikasi menghentikan pemutaran dan membatalkan request aktif.
+- Kegagalan pembuatan atau pemutaran audio ditampilkan sebagai toast dan masuk
+  ke cache notifikasi selama aplikasi berjalan.
+
+11. Dependensi sistem dan Python
 -------------------------------
 - Python packages utama: google-genai, PySide6-Essentials, PySide6-Addons, dan
   python-dotenv.

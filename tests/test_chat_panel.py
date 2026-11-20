@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+import sqlite3
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -8,15 +9,18 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QUrl
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QSize, Qt, QUrl
 from PySide6.QtGui import (
     QDragEnterEvent,
     QDragLeaveEvent,
     QDropEvent,
     QColor,
+    QFont,
+    QFontDatabase,
     QFontMetrics,
     QImage,
     QPixmap,
+    QWheelEvent,
     QTextFormat,
     QTextTable,
 )
@@ -26,6 +30,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QLabel,
     QTextBrowser,
+    QTextEdit,
     QToolButton,
     QWidget,
 )
@@ -37,6 +42,7 @@ from chat_panel import (
     MAX_ATTACHMENTS_PER_MESSAGE,
     _AttachedFile,
     _AttachmentPreviewItem,
+    _UserMessageRow,
     _WrappedMessageLabel,
     ChatPanel,
 )
@@ -55,10 +61,13 @@ class _FakeSignal:
 
 
 class _FakeChatWorker:
-    def __init__(self, _api_keys, _database) -> None:
+    def __init__(self, _api_keys, _database, unsaved_message=None) -> None:
         self.reply_received = _FakeSignal()
+        self.reply_chunk_received = _FakeSignal()
+        self.stream_reset = _FakeSignal()
         self.error_occurred = _FakeSignal()
         self.finished = _FakeSignal()
+        self.unsaved_message = unsaved_message
         self.started = False
 
     def start(self) -> None:
@@ -71,6 +80,40 @@ class _FakeChatWorker:
         pass
 
 
+class _FakeSpeechWorker:
+    instances = []
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.audio_ready = _FakeSignal()
+        self.error_occurred = _FakeSignal()
+        self.finished = _FakeSignal()
+        self.running = False
+        self.interruption_requested = False
+        self.__class__.instances.append(self)
+
+    def start(self) -> None:
+        self.running = True
+
+    def isRunning(self) -> bool:
+        return self.running
+
+    def requestInterruption(self) -> None:
+        self.interruption_requested = True
+
+    def wait(self) -> bool:
+        self.running = False
+        return True
+
+    def deleteLater(self) -> None:
+        pass
+
+    def complete(self, audio_url: str) -> None:
+        self.audio_ready.emit(audio_url)
+        self.running = False
+        self.finished.emit()
+
+
 class ChatPanelTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -79,6 +122,7 @@ class ChatPanelTests(unittest.TestCase):
     def setUp(self) -> None:
         self.database = ChatDatabase(":memory:")
         self.panel = ChatPanel(database=self.database)
+        _FakeSpeechWorker.instances.clear()
 
     def tearDown(self) -> None:
         self.panel.hide()
@@ -100,6 +144,210 @@ class ChatPanelTests(unittest.TestCase):
 
         self.assertFalse(self.panel.isVisible())
 
+    def test_long_error_toast_is_compact_and_keeps_gemini_status(self) -> None:
+        self.panel._show_error_toast(
+            "Chat Gemini gagal",
+            "503 UNAVAILABLE.\n" + ("response detail " * 40),
+        )
+
+        toast_text = self.panel._copy_toast.text()
+        self.assertLessEqual(len(toast_text), 180)
+        self.assertIn("503 UNAVAILABLE", toast_text)
+        self.assertTrue(toast_text.endswith("..."))
+
+    def test_close_icon_is_large_inside_a_standard_round_hover_target(self) -> None:
+        button = self.panel._close_button
+        self.assertEqual((button.width(), button.height()), (28, 28))
+        self.assertEqual(button.iconSize().width(), 20)
+        self.assertFalse(button.icon().isNull())
+        style = button.styleSheet()
+        self.assertIn("border: none", style)
+        self.assertIn("border-radius: 14px", style)
+        self.assertIn("QToolButton:hover", style)
+
+    def test_header_notification_button_toggles_popup(self) -> None:
+        self.panel.show_panel()
+        self.assertEqual(
+            self.panel._notification_button.accessibleName(),
+            "Notifikasi",
+        )
+        self.assertEqual(
+            self.panel._settings_button.accessibleName(),
+            "Pengaturan",
+        )
+        self.assertEqual(
+            self.panel._github_button.accessibleName(),
+            "GitHub",
+        )
+        self.assertFalse(self.panel._notification_button.icon().isNull())
+        self.assertFalse(self.panel._settings_button.icon().isNull())
+        self.assertFalse(self.panel._github_button.icon().isNull())
+        self.assertLess(
+            self.panel._notification_button.x(),
+            self.panel._github_button.x(),
+        )
+        self.assertLess(
+            self.panel._github_button.x(),
+            self.panel._settings_button.x(),
+        )
+        self.assertLess(
+            self.panel._settings_button.x(),
+            self.panel._close_button.x(),
+        )
+
+        self.panel._notification_button.click()
+        self.assertTrue(self.panel._notification_popup.isVisible())
+        self.panel._notification_button.click()
+        self.assertFalse(self.panel._notification_popup.isVisible())
+
+        self.panel._settings_button.click()
+        self.panel._github_button.click()
+
+        self.assertTrue(self.panel.isVisible())
+        self.assertEqual(self.database.load_messages(), ())
+
+    def test_errors_are_cached_and_notification_detail_can_be_copied(self) -> None:
+        self.panel.show_panel()
+        self.panel._show_error_toast(
+            "Chat Gemini gagal",
+            "503 UNAVAILABLE: temporary network failure",
+        )
+        self.panel._show_error_toast(
+            "Gagal menyimpan pesan",
+            "database is locked",
+        )
+
+        self.assertEqual(len(self.panel._notifications), 2)
+        self.assertEqual(self.panel._notification_badge.text(), "2")
+        self.assertRegex(
+            self.panel._notification_rows[0]._date_label.text(),
+            r"\d{2}/\d{2}/\d{4}, \d{2}:\d{2}",
+        )
+        self.panel._notification_button.click()
+        self.assertTrue(self.panel._notification_popup.isVisible())
+        self.assertEqual(len(self.panel._notification_rows), 2)
+        self.assertTrue(self.panel._notification_list_divider.isVisible())
+        self.assertEqual(self.panel._notification_list_divider.height(), 1)
+        self.assertEqual(self.panel._notification_list_layout.spacing(), 2)
+        self.assertLessEqual(self.panel._notification_popup.height(), 140)
+        self.assertEqual(self.panel._notification_rows[0].height(), 46)
+        header_title = self.panel._notification_list_page.findChild(
+            QLabel,
+            "notificationsTitle",
+        )
+        self.assertEqual(
+            header_title.mapTo(self.panel._notification_popup, QPoint(0, 0)).x(),
+            self.panel._notification_rows[0]
+            ._title_label.mapTo(self.panel._notification_popup, QPoint(0, 0))
+            .x(),
+        )
+        self.assertEqual(
+            header_title.mapTo(self.panel._notification_popup, QPoint(0, 0)).x(),
+            4,
+        )
+
+        notification = self.panel._notifications[0]
+        self.panel._notification_rows[0].activated.emit()
+
+        self.assertTrue(notification.is_read)
+        self.assertEqual(self.panel._notification_badge.text(), "1")
+        self.assertIs(
+            self.panel._notification_stack.currentWidget(),
+            self.panel._notification_detail_page,
+        )
+        self.assertTrue(self.panel._notification_detail_divider.isVisible())
+        self.assertEqual(self.panel._notification_detail_layout.spacing(), 3)
+        self.assertEqual(
+            self.panel._notification_back_button.mapTo(
+                self.panel._notification_popup,
+                QPoint(0, 0),
+            ).x(),
+            2,
+        )
+        self.assertEqual(
+            self.panel._notification_detail_text.toPlainText(),
+            notification.details,
+        )
+        self.assertEqual(
+            self.panel._notification_detail_text.lineWrapMode(),
+            QTextEdit.LineWrapMode.NoWrap,
+        )
+        self.assertEqual(
+            self.panel._notification_detail_text.horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+        )
+        self.assertEqual(
+            self.panel._notification_detail_text.verticalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+        )
+        copy_icon_key = self.panel._notification_copy_button.icon().cacheKey()
+        self.panel._notification_copy_button.click()
+        self.assertEqual(
+            QApplication.clipboard().text(),
+            notification.details,
+        )
+        self.assertEqual(self.panel._copy_toast.height(), 24)
+        expected_toast_width = (
+            self.panel._copy_toast.fontMetrics().horizontalAdvance("Error copied")
+            + 20
+        )
+        self.assertEqual(self.panel._copy_toast.width(), expected_toast_width)
+        self.assertFalse(self.panel._notification_copy_button.icon().isNull())
+        self.assertNotEqual(
+            self.panel._notification_copy_button.icon().cacheKey(),
+            copy_icon_key,
+        )
+        self.panel._notification_copy_reset_timer.stop()
+        self.panel._reset_notification_copy_button()
+        self.assertEqual(
+            self.panel._notification_copy_button.accessibleName(),
+            "Salin detail error",
+        )
+
+        self.panel._notification_back_button.click()
+        self.panel._mark_all_notifications_button.click()
+        self.assertFalse(self.panel._notification_badge.isVisible())
+        self.panel._clear_notifications_button.click()
+        self.assertEqual(self.panel._notifications, [])
+        self.assertEqual(self.panel._notification_rows, [])
+        empty_label = self.panel._notification_list_content.findChild(
+            QLabel,
+            "emptyNotificationsLabel",
+        )
+        self.assertEqual(empty_label.text(), "Tidak ada notifikasi")
+        self.assertGreaterEqual(empty_label.minimumHeight(), 48)
+        self.assertGreaterEqual(self.panel._notification_popup.height(), 96)
+
+    def test_clicking_outside_notification_popup_closes_it(self) -> None:
+        self.panel.show_panel()
+        self.panel._show_error_toast("Chat Gemini gagal", "Unavailable")
+        self.panel._notification_button.click()
+        self.assertTrue(self.panel._notification_popup.isVisible())
+
+        QTest.mouseClick(self.panel._input, Qt.MouseButton.LeftButton)
+
+        self.assertFalse(self.panel._notification_popup.isVisible())
+
+        self.panel._notification_button.click()
+        position = QPoint(5, 5)
+        global_position = self.panel._input.mapToGlobal(position)
+        wheel_event = QWheelEvent(
+            QPointF(position),
+            QPointF(global_position),
+            QPoint(0, 0),
+            QPoint(0, 120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        self.panel._notification_dismiss_filter.eventFilter(
+            self.panel._input,
+            wheel_event,
+        )
+
+        self.assertFalse(self.panel._notification_popup.isVisible())
+
     def test_panel_can_be_dragged_from_the_header(self) -> None:
         self.panel.show_panel()
         self.app.processEvents()
@@ -118,6 +366,48 @@ class ChatPanelTests(unittest.TestCase):
         )
 
         self.assertNotEqual(self.panel.pos(), initial_position)
+
+    def test_header_border_reaches_both_panel_edges(self) -> None:
+        self.panel.show_panel()
+        self.app.processEvents()
+
+        self.assertEqual(self.panel._header.y(), 0)
+        self.assertLessEqual(self.panel._header.height(), 34)
+        self.assertEqual(self.panel._header.layout().spacing(), 2)
+        self.assertEqual(
+            self.panel._header.findChild(QLabel).text(),
+            "Chat Speech AI",
+        )
+        input_left = self.panel._input_frame.mapTo(
+            self.panel,
+            QPoint(0, 0),
+        ).x()
+        input_right = input_left + self.panel._input_frame.width()
+        title = self.panel._header.findChild(QLabel)
+        self.assertEqual(title.mapTo(self.panel, QPoint(0, 0)).x(), input_left)
+        self.assertEqual(
+            self.panel._close_button.mapTo(
+                self.panel,
+                QPoint(self.panel._close_button.width(), 0),
+            ).x(),
+            input_right,
+        )
+        image = QImage(self.panel.size(), QImage.Format.Format_ARGB32)
+        image.fill(Qt.GlobalColor.transparent)
+        self.panel.render(image)
+        border_y = self.panel._header.height() - 1
+        self.assertEqual(
+            image.pixelColor(2, border_y),
+            QColor("#3a3f46"),
+        )
+        self.assertEqual(
+            image.pixelColor(self.panel.width() - 3, border_y),
+            QColor("#3a3f46"),
+        )
+        self.assertEqual(
+            image.pixelColor(self.panel.width() // 2, 1),
+            QColor("#24272d"),
+        )
 
     def test_panel_position_snaps_inside_available_desktop_area(self) -> None:
         screen = self.app.primaryScreen()
@@ -268,6 +558,258 @@ class ChatPanelTests(unittest.TestCase):
         self.assertIsNone(model_row.findChild(QWidget, "modelMessageBubble"))
         self.assertIsNotNone(model_row.findChild(QTextBrowser, "messageContent"))
 
+    def test_database_save_failure_still_sends_unsaved_message_to_gemini(self) -> None:
+        self.panel._api_keys = ("test-key",)
+        self.panel._input.setPlainText("Keep sending despite database failure")
+        with (
+            patch.object(
+                self.database,
+                "append_user_message",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ),
+            patch("chat_panel.ChatResponseWorker", _FakeChatWorker),
+        ):
+            self.panel._submit_message()
+            worker = self.panel._chat_worker
+            self.assertTrue(worker.started)
+            self.assertEqual(
+                worker.unsaved_message.content,
+                "Keep sending despite database failure",
+            )
+            self.assertEqual(self.database.load_messages(), ())
+            self.assertIn("database is locked", self.panel._copy_toast.text())
+
+            worker.error_occurred.emit("Gemini unavailable")
+            worker.finished.emit()
+
+        self.assertEqual(self.database.load_messages(), ())
+        user_row = self.panel._message_layout.itemAt(0).widget()
+        self.assertIsInstance(user_row, _UserMessageRow)
+        self.assertFalse(user_row._retry_button.isHidden())
+        self.assertIn("Gemini unavailable", self.panel._copy_toast.text())
+
+    def test_database_save_failure_then_gemini_success_persists_exchange(self) -> None:
+        self.panel._api_keys = ("test-key",)
+        self.panel._input.setPlainText("Persist after Gemini replies")
+        with (
+            patch.object(
+                self.database,
+                "append_user_message",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ),
+            patch("chat_panel.ChatResponseWorker", _FakeChatWorker),
+        ):
+            self.panel._submit_message()
+            worker = self.panel._chat_worker
+            self.assertEqual(
+                worker.unsaved_message.content,
+                "Persist after Gemini replies",
+            )
+            worker.reply_received.emit("Gemini reply")
+            worker.finished.emit()
+
+        self.assertEqual(
+            [(message.role, message.content) for message in self.database.load_messages()],
+            [
+                ("user", "Persist after Gemini replies"),
+                ("model", "Gemini reply"),
+            ],
+        )
+
+    def test_gemini_failure_rolls_back_user_and_retry_saves_successful_exchange(self) -> None:
+        self.panel._api_keys = ("test-key",)
+        self.panel._input.setPlainText("Retry this turn")
+        with patch("chat_panel.ChatResponseWorker", _FakeChatWorker):
+            self.panel._submit_message()
+            worker = self.panel._chat_worker
+            self.assertEqual(
+                [message.content for message in self.database.load_messages()],
+                ["Retry this turn"],
+            )
+
+            worker.error_occurred.emit("temporary network error")
+            worker.finished.emit()
+
+            self.assertEqual(self.database.load_messages(), ())
+            user_row = self.panel._message_layout.itemAt(0).widget()
+            self.assertFalse(user_row._retry_button.isHidden())
+            user_row._retry_button.click()
+
+            retry_worker = self.panel._chat_worker
+            self.assertTrue(retry_worker.started)
+            retry_worker.reply_received.emit("Recovered reply")
+            retry_worker.finished.emit()
+
+        self.assertEqual(
+            [(message.role, message.content) for message in self.database.load_messages()],
+            [("user", "Retry this turn"), ("model", "Recovered reply")],
+        )
+        self.assertTrue(user_row._retry_button.isHidden())
+
+    def test_retry_icon_sits_left_and_bottom_aligned_to_failed_user_bubble(self) -> None:
+        self.panel.show_panel()
+        self.panel._add_message_row(
+            self.database.append_user_message("A message that needs retry")
+        )
+        self.app.processEvents()
+        user_row = self.panel._message_layout.itemAt(0).widget()
+        user_row.set_retry_visible(True)
+        self.app.processEvents()
+
+        self.assertLess(user_row._retry_button.x(), user_row._bubble.x())
+        self.assertLessEqual(
+            user_row._bubble.x()
+            - user_row._retry_button.x()
+            - user_row._retry_button.width(),
+            3,
+        )
+        self.assertEqual(
+            user_row._retry_button.y() + user_row._retry_button.height(),
+            user_row._bubble.y() + user_row._bubble.height(),
+        )
+
+    def test_database_reply_save_retry_does_not_call_gemini_again(self) -> None:
+        self.panel._api_keys = ("test-key",)
+        self.panel._input.setPlainText("Save the existing reply")
+        original_save_reply = self.database.append_model_message
+        with patch("chat_panel.ChatResponseWorker", _FakeChatWorker):
+            self.panel._submit_message()
+            worker = self.panel._chat_worker
+            with patch.object(
+                self.database,
+                "append_model_message",
+                side_effect=sqlite3.OperationalError("disk is full"),
+            ):
+                worker.reply_received.emit("Already generated reply")
+                worker.finished.emit()
+
+            user_row = self.panel._message_layout.itemAt(0).widget()
+            self.assertFalse(user_row._retry_button.isHidden())
+            self.assertIn("disk is full", self.panel._copy_toast.text())
+            user_row._retry_button.click()
+
+        self.assertEqual(
+            [(message.role, message.content) for message in self.database.load_messages()],
+            [("user", "Save the existing reply"), ("model", "Already generated reply")],
+        )
+        self.assertTrue(user_row._retry_button.isHidden())
+        self.assertEqual(self.panel._chat_worker, None)
+
+    def test_database_exchange_retry_saves_existing_gemini_reply(self) -> None:
+        self.panel._api_keys = ("test-key",)
+        self.panel._input.setPlainText("Save both messages")
+        with (
+            patch.object(
+                self.database,
+                "append_user_message",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ),
+            patch("chat_panel.ChatResponseWorker", _FakeChatWorker),
+        ):
+            self.panel._submit_message()
+            worker = self.panel._chat_worker
+            with patch.object(
+                self.database,
+                "append_exchange",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ):
+                worker.reply_received.emit("Keep this generated reply")
+                worker.finished.emit()
+
+            user_row = self.panel._message_layout.itemAt(0).widget()
+            self.assertFalse(user_row._retry_button.isHidden())
+            self.assertEqual(self.database.load_messages(), ())
+            user_row._retry_button.click()
+
+        self.assertEqual(
+            [(message.role, message.content) for message in self.database.load_messages()],
+            [("user", "Save both messages"), ("model", "Keep this generated reply")],
+        )
+        self.assertTrue(user_row._retry_button.isHidden())
+        self.assertEqual(self.panel._chat_worker, None)
+
+    def test_streaming_reply_reveals_characters_and_persists_one_final_message(self) -> None:
+        self.panel._api_keys = ("test-key",)
+        self.panel._input.setPlainText("Hello Gemini")
+        with patch("chat_panel.ChatResponseWorker", _FakeChatWorker):
+            self.panel._submit_message()
+            worker = self.panel._chat_worker
+            self.assertIsNotNone(worker)
+            streamed_text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            worker.reply_chunk_received.emit(streamed_text)
+
+            model_row = self.panel._message_layout.itemAt(1).widget()
+            content_label = model_row.findChild(QTextBrowser, "messageContent")
+            self.assertEqual(content_label.toPlainText(), "")
+            self.panel._display_next_reply_character()
+            self.assertEqual(content_label.toPlainText(), streamed_text[:32])
+            self.panel._display_next_reply_character()
+            self.assertEqual(content_label.toPlainText(), streamed_text)
+
+            worker.reply_received.emit(streamed_text)
+            worker.finished.emit()
+
+        self.assertEqual(
+            [(message.role, message.content) for message in self.database.load_messages()],
+            [("user", "Hello Gemini"), ("model", streamed_text)],
+        )
+        self.assertEqual(content_label.text(), streamed_text)
+        self.assertFalse(self.panel._is_sending)
+
+    def test_streaming_reply_renders_markdown_before_it_finishes(self) -> None:
+        self.panel._api_keys = ("test-key",)
+        self.panel._input.setPlainText("Hello Gemini")
+        with patch("chat_panel.ChatResponseWorker", _FakeChatWorker):
+            self.panel._submit_message()
+            worker = self.panel._chat_worker
+            self.assertIsNotNone(worker)
+            streamed_text = "# Live heading\n**bold**"
+            worker.reply_chunk_received.emit(streamed_text)
+            self.panel._display_next_reply_character()
+
+            model_row = self.panel._message_layout.itemAt(1).widget()
+            content_label = model_row.findChild(QTextBrowser, "messageContent")
+            self.assertEqual(content_label.toPlainText(), "Live heading\nbold")
+            self.assertEqual(
+                content_label.document().begin().blockFormat().headingLevel(),
+                1,
+            )
+            bold_block = content_label.document().begin().next()
+            self.assertGreaterEqual(
+                bold_block.begin().fragment().charFormat().fontWeight(),
+                QFont.Weight.DemiBold,
+            )
+
+            worker.reply_received.emit(streamed_text)
+            worker.finished.emit()
+
+    def test_stream_reset_discards_partial_text_before_retry(self) -> None:
+        self.panel._api_keys = ("test-key",)
+        self.panel._input.setPlainText("Hello Gemini")
+        with patch("chat_panel.ChatResponseWorker", _FakeChatWorker):
+            self.panel._submit_message()
+            worker = self.panel._chat_worker
+            self.assertIsNotNone(worker)
+            worker.reply_chunk_received.emit("bad")
+            self.panel._display_next_reply_character()
+            self.panel._display_next_reply_character()
+
+            worker.stream_reset.emit()
+
+            model_row = self.panel._message_layout.itemAt(1).widget()
+            content_label = model_row.findChild(QTextBrowser, "messageContent")
+            self.assertEqual(content_label.toPlainText(), "")
+            worker.reply_chunk_received.emit("good")
+            for _ in range(4):
+                self.panel._display_next_reply_character()
+            worker.reply_received.emit("good")
+            worker.finished.emit()
+
+        self.assertEqual(
+            [message.content for message in self.database.load_messages()],
+            ["Hello Gemini", "good"],
+        )
+
     def test_model_message_uses_available_row_width_without_a_bubble(self) -> None:
         message = self.database.append_model_message(
             "This response should use the conversation width."
@@ -305,7 +847,7 @@ class ChatPanelTests(unittest.TestCase):
             content_label.height() + model_row.layout().spacing() + model_row._actions.height(),
         )
 
-    def test_model_message_actions_are_visual_only_and_have_requested_order(self) -> None:
+    def test_model_message_copy_works_and_actions_keep_requested_order(self) -> None:
         message = self.database.append_model_message("A response")
         self.panel.show_panel()
         self.panel._add_message_row(message)
@@ -340,12 +882,203 @@ class ChatPanelTests(unittest.TestCase):
             all(button.iconSize().width() > 16 for button in model_row._left_actions)
         )
 
-        for button in model_row._left_actions + (model_row._regenerate_button,):
+        for button in model_row._left_actions[1:] + (
+            model_row._regenerate_button,
+        ):
             button.click()
         self.assertEqual(
             [(stored.role, stored.content) for stored in self.database.load_messages()],
             [("model", "A response")],
         )
+        model_row._copy_button.click()
+        self.assertEqual(QApplication.clipboard().text(), "A response")
+        self.assertEqual(model_row._copy_icon_state, "check")
+        self.assertEqual(self.panel._copy_toast.text(), "Message copied")
+        self.assertTrue(self.panel._copy_toast.isVisible())
+        model_row._copy_feedback_timer.timeout.emit()
+        self.assertEqual(model_row._copy_icon_state, "copy")
+
+    def test_like_dislike_buttons_toggle_visual_state_without_saving(self) -> None:
+        message = self.database.append_model_message("A response")
+        self.panel.show_panel()
+        self.panel._add_message_row(message)
+        self.app.processEvents()
+        row = self.panel._message_layout.itemAt(0).widget()
+        icon_size = QSize(24, 24)
+        like_icon = row._like_button.icon().pixmap(icon_size).toImage()
+        dislike_icon = row._dislike_button.icon().pixmap(icon_size).toImage()
+        like_style = row._like_button.styleSheet()
+        dislike_style = row._dislike_button.styleSheet()
+
+        def opaque_bounds(image) -> tuple[int, int, int, int]:
+            points = [
+                (x, y)
+                for y in range(image.height())
+                for x in range(image.width())
+                if image.pixelColor(x, y).alpha() > 0
+            ]
+            return (
+                min(x for x, _ in points),
+                min(y for _, y in points),
+                max(x for x, _ in points),
+                max(y for _, y in points),
+            )
+
+        stored_before = [
+            (stored.role, stored.content)
+            for stored in self.database.load_messages()
+        ]
+
+        row._like_button.click()
+
+        self.assertTrue(row._like_button.isChecked())
+        self.assertFalse(row._dislike_button.isChecked())
+        active_like_icon = row._like_button.icon().pixmap(icon_size).toImage()
+        self.assertNotEqual(
+            active_like_icon,
+            like_icon,
+        )
+        self.assertEqual(opaque_bounds(active_like_icon), opaque_bounds(like_icon))
+        self.assertEqual(row._like_button.styleSheet(), like_style)
+
+        row._dislike_button.click()
+        self.assertFalse(row._like_button.isChecked())
+        self.assertTrue(row._dislike_button.isChecked())
+        self.assertEqual(
+            row._like_button.icon().pixmap(icon_size).toImage(),
+            like_icon,
+        )
+        active_dislike_icon = row._dislike_button.icon().pixmap(icon_size).toImage()
+        self.assertNotEqual(active_dislike_icon, dislike_icon)
+        self.assertEqual(
+            opaque_bounds(active_dislike_icon),
+            opaque_bounds(dislike_icon),
+        )
+        self.assertEqual(row._dislike_button.styleSheet(), dislike_style)
+
+        row._dislike_button.click()
+        self.assertFalse(row._dislike_button.isChecked())
+        self.assertEqual(
+            row._dislike_button.icon().pixmap(icon_size).toImage(),
+            dislike_icon,
+        )
+        self.assertEqual(
+            [
+                (stored.role, stored.content)
+                for stored in self.database.load_messages()
+            ],
+            stored_before,
+        )
+
+    def test_model_speech_button_requests_audio_and_stops_playback(self) -> None:
+        message = self.database.append_model_message("Hello **there**.")
+        self.panel.show_panel()
+        self.panel._add_message_row(message)
+        self.app.processEvents()
+        row = self.panel._message_layout.itemAt(0).widget()
+        player = self.panel._speech_player
+
+        with (
+            patch("chat_panel.SoundOfTextWorker", _FakeSpeechWorker),
+            patch.object(player, "setSource") as set_source,
+            patch.object(player, "play") as play,
+            patch.object(player, "stop") as stop,
+        ):
+            row._speech_button.click()
+            worker = _FakeSpeechWorker.instances[-1]
+            self.assertEqual(worker.text, "Hello there.")
+            self.assertEqual(row._speech_state, "loading")
+
+            audio_url = "https://cdn.example.test/audio.mp3"
+            worker.complete(audio_url)
+            set_source.assert_any_call(QUrl(audio_url))
+            play.assert_called_once_with()
+
+            self.panel._handle_speech_playback_state(
+                QMediaPlayer.PlaybackState.PlayingState
+            )
+            self.assertEqual(row._speech_state, "playing")
+            self.assertEqual(
+                row._speech_button.accessibleName(),
+                "Hentikan pembacaan",
+            )
+
+            row._speech_button.click()
+
+        self.assertEqual(row._speech_state, "idle")
+        stop.assert_called_once_with()
+        set_source.assert_called_with(QUrl())
+
+    def test_clicking_speech_while_loading_cancels_the_request(self) -> None:
+        message = self.database.append_model_message("A response")
+        self.panel.show_panel()
+        self.panel._add_message_row(message)
+        self.app.processEvents()
+        row = self.panel._message_layout.itemAt(0).widget()
+
+        with (
+            patch("chat_panel.SoundOfTextWorker", _FakeSpeechWorker),
+            patch.object(self.panel._speech_player, "stop"),
+            patch.object(self.panel._speech_player, "setSource"),
+        ):
+            row._speech_button.click()
+            worker = _FakeSpeechWorker.instances[-1]
+            row._speech_button.click()
+
+        self.assertTrue(worker.interruption_requested)
+        self.assertEqual(row._speech_state, "idle")
+
+    def test_speech_request_switches_rows_and_cancels_pending_row(self) -> None:
+        first_message = self.database.append_model_message("First response")
+        second_message = self.database.append_model_message("Second response")
+        self.panel.show_panel()
+        self.panel._add_message_row(first_message)
+        self.panel._add_message_row(second_message)
+        self.app.processEvents()
+        first_row = self.panel._message_layout.itemAt(0).widget()
+        second_row = self.panel._message_layout.itemAt(1).widget()
+
+        with (
+            patch("chat_panel.SoundOfTextWorker", _FakeSpeechWorker),
+            patch.object(self.panel._speech_player, "stop"),
+            patch.object(self.panel._speech_player, "setSource"),
+        ):
+            first_row._speech_button.click()
+            worker = _FakeSpeechWorker.instances[-1]
+            second_row._speech_button.click()
+
+            self.assertTrue(worker.interruption_requested)
+            self.assertIs(self.panel._pending_speech_row, second_row)
+            self.assertEqual(first_row._speech_state, "idle")
+            self.assertEqual(second_row._speech_state, "loading")
+
+            second_row._speech_button.click()
+            self.assertIsNone(self.panel._pending_speech_row)
+            self.assertEqual(second_row._speech_state, "idle")
+            second_row._speech_button.click()
+            self.assertIs(self.panel._pending_speech_row, second_row)
+            self.assertEqual(second_row._speech_state, "loading")
+            self.panel.hide()
+            self.assertIsNone(self.panel._pending_speech_row)
+            self.assertEqual(second_row._speech_state, "idle")
+
+        self.assertIsNone(self.panel._pending_speech_row)
+        self.assertEqual(second_row._speech_state, "idle")
+
+    def test_speech_text_renders_markdown_and_includes_code_block_content(self) -> None:
+        message = self.database.append_model_message(
+            "Use **this** command:\n\n```bash\nprintf hello\n```"
+        )
+        self.panel.show_panel()
+        self.panel._add_message_row(message)
+        self.app.processEvents()
+        row = self.panel._message_layout.itemAt(0).widget()
+
+        text = row.speech_text()
+
+        self.assertIn("Use this command:", text)
+        self.assertIn("printf hello", text)
+        self.assertNotIn("SPEECHCODEBLOCK", text)
 
     def test_scroll_to_latest_button_tracks_scroll_position(self) -> None:
         self.panel.show_panel()
@@ -467,14 +1200,11 @@ class ChatPanelTests(unittest.TestCase):
         self.assertGreater(short_row.width(), short_bubble.width())
         self.assertLess(short_bubble.width(), 72)
         self.assertLess(short_bubble.width(), 360)
-        greeting_prefix_width = QFontMetrics(
+        prefix_width = QFontMetrics(
             long_bubble._label.font()
-        ).horizontalAdvance("Halo! ")
-        self.assertEqual(
-            long_bubble.width(),
-            long_row.width() - greeting_prefix_width,
-        )
-        self.assertEqual(long_bubble.x(), greeting_prefix_width)
+        ).horizontalAdvance("Ada ")
+        self.assertEqual(long_bubble.width(), long_row.width() - prefix_width)
+        self.assertEqual(long_bubble.x(), prefix_width)
         self.assertGreater(long_bubble.width(), short_bubble.width())
         self.assertGreater(long_bubble.height(), short_bubble.height())
         self.assertEqual(
@@ -486,11 +1216,29 @@ class ChatPanelTests(unittest.TestCase):
             model_row.width(),
             long_bubble.x() + long_bubble.width(),
         )
+        self.assertEqual(
+            self.panel._scroll_area.horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        self.assertLessEqual(
+            long_row.width(),
+            self.panel._scroll_area.viewport().width(),
+        )
         self.assertEqual(self.panel._message_layout.spacing(), 4)
 
     def test_chat_messages_render_markdown(self) -> None:
-        message = self.database.append_user_message("**Bold** and `code`")
-        model_message = self.database.append_model_message("**Formatted answer**")
+        markdown = (
+            "# Heading\n\n"
+            "**Bold**, *italic*, ~~strike~~, and `inline code`.\n\n"
+            "- First item\n  - Nested item\n\n"
+            "> A quotation\n\n"
+            "```bash\necho 'Hello'\n```\n\n"
+            "[Link](https://example.com)\n\n"
+            "| Name | Status |\n| --- | --- |\n| Item | Done |\n\n"
+            "- [x] Completed\n\n---"
+        )
+        message = self.database.append_user_message(markdown)
+        model_message = self.database.append_model_message(markdown)
         self.panel.show_panel()
         self.panel._add_message_row(message)
         self.panel._add_message_row(model_message)
@@ -498,21 +1246,37 @@ class ChatPanelTests(unittest.TestCase):
 
         user_row = self.panel._message_layout.itemAt(0).widget()
         model_row = self.panel._message_layout.itemAt(1).widget()
+        user_label = user_row._bubble._label
         model_label = model_row.findChild(QTextBrowser, "messageContent")
 
         self.assertEqual(
-            user_row._bubble._label.textFormat(),
+            user_label.textFormat(),
             Qt.TextFormat.MarkdownText,
         )
         self.assertIsNotNone(model_label)
         self.assertEqual(model_label.textFormat(), Qt.TextFormat.MarkdownText)
+        self.assertEqual(
+            user_label.document().toHtml(),
+            model_label.document().toHtml(),
+        )
+        self.assertEqual(len(user_label._code_widgets), 1)
+        self.assertEqual(len(model_label._code_widgets), 1)
+        self.assertTrue(
+            user_label.textInteractionFlags()
+            & Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        self.assertTrue(
+            model_label.textInteractionFlags()
+            & Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
 
     def test_markdown_uses_compact_lists_and_github_style_blocks(self) -> None:
         markdown = (
             "# Heading\n\n"
-            "1. First item\n2. Second item\n\n"
+            "1. First item\n   1. Nested item\n2. Second item\n\n"
             "> A quote\n\n"
-            "Inline `code` and ~~strikethrough~~ with [a link](https://example.com)\n\n"
+            "Inline `code`, **bold**, ~~strikethrough~~ with "
+            "[a link](https://example.com)\n\n"
             "```python\nprint('hello')\n```\n\n"
             "| Name | Value |\n| --- | --- |\n| item | 1 |\n\n"
             "- [ ] Task\n- [x] Done\n"
@@ -522,10 +1286,11 @@ class ChatPanelTests(unittest.TestCase):
         html = document.toHtml().lower()
         block = document.begin()
         first_list_block = None
+        nested_list_block = None
         heading_block = None
         quote_block = None
-        code_block = None
         inline_code_is_styled = False
+        bold_is_demibold = False
         link_is_styled = False
         while block.isValid():
             if block.blockFormat().headingLevel():
@@ -534,12 +1299,11 @@ class ChatPanelTests(unittest.TestCase):
                 QTextFormat.Property.BlockQuoteLevel
             ):
                 quote_block = block
-            if block.blockFormat().property(
-                QTextFormat.Property.BlockCodeLanguage
-            ):
-                code_block = block
             if block.textList() is not None:
-                first_list_block = block
+                if block.text() == "First item":
+                    first_list_block = block
+                elif block.text() == "Nested item":
+                    nested_list_block = block
             fragment_iterator = block.begin()
             while not fragment_iterator.atEnd():
                 fragment = fragment_iterator.fragment()
@@ -551,6 +1315,10 @@ class ChatPanelTests(unittest.TestCase):
                             and char_format.background().color()
                             == QColor("#2d333b")
                         )
+                    if fragment.text() == "bold":
+                        bold_is_demibold = (
+                            char_format.fontWeight() == QFont.Weight.DemiBold
+                        )
                     if char_format.isAnchor():
                         link_is_styled = (
                             char_format.foreground().color()
@@ -560,23 +1328,19 @@ class ChatPanelTests(unittest.TestCase):
             block = block.next()
 
         self.assertIsNotNone(first_list_block)
+        self.assertIsNotNone(nested_list_block)
         self.assertIsNotNone(heading_block)
         self.assertIsNotNone(quote_block)
-        self.assertIsNotNone(code_block)
         self.assertEqual(first_list_block.textList().format().indent(), 0)
         self.assertEqual(first_list_block.blockFormat().leftMargin(), 12)
+        self.assertEqual(nested_list_block.textList().format().indent(), 0)
+        self.assertEqual(nested_list_block.blockFormat().leftMargin(), 28)
         self.assertEqual(
             quote_block.blockFormat().background().color(),
             QColor("#262b33"),
         )
-        self.assertEqual(
-            code_block.blockFormat().background().color(),
-            QColor("#161b22"),
-        )
-        self.assertTrue(
-            code_block.begin().fragment().charFormat().fontFixedPitch()
-        )
         self.assertTrue(inline_code_is_styled)
+        self.assertTrue(bold_is_demibold)
         self.assertTrue(link_is_styled)
         self.assertGreater(
             heading_block.begin().fragment().charFormat().fontPointSize(),
@@ -584,7 +1348,13 @@ class ChatPanelTests(unittest.TestCase):
         )
         self.assertIn("<h1", html)
         self.assertIn("<ol", html)
-        self.assertIn("<pre", html)
+        self.assertEqual(len(view._code_widgets), 1)
+        code_block = next(iter(view._code_widgets.values()))
+        self.assertEqual(code_block._editor.toPlainText(), "print('hello')")
+        fixed_font = QFontDatabase.systemFont(
+            QFontDatabase.SystemFont.FixedFont
+        )
+        self.assertEqual(code_block._editor.font().family(), fixed_font.family())
         self.assertIn("<table", html)
         table = next(
             (
@@ -600,6 +1370,175 @@ class ChatPanelTests(unittest.TestCase):
         self.assertIn('href="https://example.com"', html)
         self.assertIn('class="unchecked"', html)
         self.assertIn("blockquote", document.defaultStyleSheet())
+
+    def test_code_blocks_limit_lines_scroll_copy_and_preserve_following_text(
+        self,
+    ) -> None:
+        source_lines = [f"line_{index} = {index}" for index in range(18)]
+        source_lines.append('long_line = "' + "x" * 200 + '"')
+        source = "\n".join(source_lines)
+        markdown = (
+            f"Before code\n\n```python\n{source}\n```\n\n"
+            "After fenced block"
+        )
+        view = _WrappedMessageLabel(markdown, None)
+        view.resize(360, 400)
+        view.show()
+        self.app.processEvents()
+
+        code_block = next(iter(view._code_widgets.values()))
+        editor = code_block._editor
+        line_height = editor.fontMetrics().lineSpacing()
+        self.assertEqual(editor.toPlainText(), source)
+        self.assertEqual(code_block.findChildren(QLabel)[0].text(), "python")
+        self.assertGreater(editor.verticalScrollBar().maximum(), 0)
+        self.assertGreater(editor.horizontalScrollBar().maximum(), 0)
+        self.assertLessEqual(editor.viewport().height(), line_height * 10)
+        self.assertTrue(code_block._copy_button.isVisible())
+        self.assertIn("border: none", code_block._copy_button.styleSheet())
+        self.assertNotIn("1px solid", code_block._copy_button.styleSheet())
+        editor.verticalScrollBar().setValue(editor.verticalScrollBar().maximum())
+        editor.horizontalScrollBar().setValue(
+            editor.horizontalScrollBar().maximum()
+        )
+        self.assertGreater(editor.firstVisibleBlock().blockNumber(), 0)
+        self.assertGreater(editor.horizontalScrollBar().value(), 0)
+
+        after_block = view.document().begin()
+        while after_block.isValid() and after_block.text() != "After fenced block":
+            after_block = after_block.next()
+        self.assertTrue(after_block.isValid())
+        after_y = view.document().documentLayout().blockBoundingRect(after_block).y()
+        self.assertGreaterEqual(
+            after_y,
+            code_block.y() + code_block.height(),
+        )
+
+        initial_y = code_block.y()
+        view.resize(360, 150)
+        self.app.processEvents()
+        view.verticalScrollBar().setValue(10)
+        self.app.processEvents()
+        self.assertEqual(code_block.y(), initial_y - 10)
+        view.verticalScrollBar().setValue(0)
+        view.resize(360, 400)
+        self.app.processEvents()
+
+        QTest.mouseMove(view, QPoint(view.width() - 2, view.height() - 2))
+        QTest.qWait(80)
+        self.assertTrue(code_block._copy_button.isVisible())
+        QTest.mouseMove(code_block, QPoint(60, 40))
+        QTest.qWait(20)
+        self.assertTrue(code_block._copy_button.isVisible())
+        QTest.mouseClick(code_block._copy_button, Qt.MouseButton.LeftButton)
+        self.assertEqual(QApplication.clipboard().text(), source)
+        view.close()
+
+    def test_code_blocks_use_language_aware_syntax_colors(self) -> None:
+        python_view = _WrappedMessageLabel(
+            "```python\n# 🙂\ndef greet():\n    return 'hello'\n```",
+            None,
+        )
+        bash_view = _WrappedMessageLabel(
+            '```bash\necho "$HOME"\n```',
+            None,
+        )
+        python_view.show()
+        bash_view.show()
+        self.app.processEvents()
+        python_editor = next(iter(python_view._code_widgets.values()))._editor
+        bash_editor = next(iter(bash_view._code_widgets.values()))._editor
+
+        def color_at(editor, text: str) -> QColor:
+            cursor = editor.document().find(text)
+            self.assertFalse(cursor.isNull())
+            return cursor.charFormat().foreground().color()
+
+        self.assertEqual(color_at(python_editor, "def"), QColor("#ff7b72"))
+        self.assertEqual(color_at(python_editor, "greet"), QColor("#d2a8ff"))
+        self.assertEqual(color_at(python_editor, "'hello'"), QColor("#a5d6ff"))
+        self.assertEqual(python_editor.verticalScrollBar().maximum(), 0)
+        self.assertEqual(color_at(bash_editor, '"$HOME"'), QColor("#a5d6ff"))
+        self.assertNotEqual(
+            color_at(bash_editor, "echo"),
+            QColor("#e6edf3"),
+        )
+
+        capped_view = _WrappedMessageLabel(
+            "```python\n"
+            + "\n".join(f"line_{index}" for index in range(11))
+            + "\n```",
+            None,
+        )
+        capped_view.show()
+        self.app.processEvents()
+        capped_editor = next(iter(capped_view._code_widgets.values()))._editor
+        self.assertGreater(capped_editor.verticalScrollBar().maximum(), 0)
+        self.assertEqual(capped_editor.horizontalScrollBar().maximum(), 0)
+        self.assertLessEqual(
+            capped_editor.viewport().height(),
+            capped_editor.fontMetrics().lineSpacing() * 10,
+        )
+        long_view = _WrappedMessageLabel(
+            "```python\n"
+            + "\n".join("print(1)" for _ in range(1000))
+            + "\n```",
+            None,
+        )
+        long_view.show()
+        self.app.processEvents()
+        long_editor = next(iter(long_view._code_widgets.values()))._editor
+        expected_gutter_width = (
+            long_editor.fontMetrics().horizontalAdvance("9999") + 4
+        )
+        self.assertEqual(long_editor.blockCount(), 1000)
+        self.assertEqual(long_editor.line_number_area_width(), expected_gutter_width)
+        self.assertEqual(
+            long_editor._line_number_area.width(),
+            expected_gutter_width,
+        )
+        python_view.close()
+        bash_view.close()
+        capped_view.close()
+        long_view.close()
+
+    def test_copying_code_shows_toast_and_temporarily_changes_icon(self) -> None:
+        message = self.database.append_model_message(
+            "```bash\necho 'Code copied'\n```"
+        )
+        self.panel.show_panel()
+        self.panel._add_message_row(message)
+        self.app.processEvents()
+        row = self.panel._message_layout.itemAt(0).widget()
+        content = row.findChild(QTextBrowser, "messageContent")
+        code_block = next(iter(content._code_widgets.values()))
+
+        code_block._copy_button.click()
+
+        self.assertEqual(QApplication.clipboard().text(), "echo 'Code copied'")
+        self.assertEqual(code_block._copy_icon_state, "check")
+        self.assertTrue(code_block._copy_feedback_timer.isActive())
+        self.assertTrue(self.panel._copy_toast.isVisible())
+        self.assertEqual(self.panel._copy_toast.text(), "Code copied")
+        self.assertEqual(code_block._copy_feedback_timer.interval(), 1600)
+        code_block._copy_feedback_timer.timeout.emit()
+        self.assertEqual(code_block._copy_icon_state, "copy")
+
+        user_message = self.database.append_user_message(
+            "```python\nprint('user code')\n```"
+        )
+        self.panel._add_message_row(user_message)
+        self.app.processEvents()
+        user_row = self.panel._message_layout.itemAt(1).widget()
+        user_code_block = next(
+            iter(user_row._bubble._label._code_widgets.values())
+        )
+        user_code_block._copy_button.click()
+        self.assertEqual(
+            QApplication.clipboard().text(),
+            "print('user code')",
+        )
+        self.assertEqual(self.panel._copy_toast.text(), "Code copied")
 
     def test_long_model_reply_is_fully_stored_and_auto_scrolled_into_view(self) -> None:
         content = "Pembahasan lengkap:\n\n" + "\n".join(
@@ -635,10 +1574,6 @@ class ChatPanelTests(unittest.TestCase):
         scroll_style = self.panel._scroll_area.styleSheet()
         self.assertIn("QScrollBar::up-arrow:vertical", scroll_style)
         self.assertIn("height: 0", scroll_style)
-        self.assertIn(
-            "border-bottom: 1px solid #3a3f46",
-            self.panel._header.styleSheet(),
-        )
         input_top = self.panel._input_frame.mapTo(
             self.panel,
             QPoint(0, 0),
@@ -735,7 +1670,7 @@ class ChatPanelTests(unittest.TestCase):
             with patch("chat_panel.ChatResponseWorker", _FakeChatWorker):
                 self.panel._submit_message()
 
-            self.assertFalse(cached_path.exists())
+            self.assertTrue(cached_path.exists())
             message = self.database.load_messages()[0]
             self.assertEqual(message.content, "")
             self.assertEqual(message.attachments[0].name, "notes.txt")
